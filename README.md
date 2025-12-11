@@ -68,22 +68,29 @@ Every exported JSON now includes a `timeline` array spanning 35 checkpoints: den
 
 ## Deployment
 
-The server keeps live assets separate from active development under `releases/`:
+Keep production files under the repo-local `releases/` tree (ideal for `/srv/server/nn-vis` on the new host):
 
-- `releases/current/` – files served by your static HTTP server.
-- `releases/backups/<timestamp>/` – point-in-time snapshots for quick rollback.
+- `releases/current/` – files served by nginx.
+- `releases/backups/<timestamp>/` – immutable snapshots for quick rollback (each stamped with the commit hash in `.commit`).
 - `releases/.deploy_tmp/` – staging area used during deployment.
 
-To publish the code you currently have checked out, run the deploy script from the repository root:
+From the repo root run:
 
 ```bash
-./deploy.sh
+./deploy.sh [commit-ish]
 ```
 
-You can target a different commit or branch explicitly:
+When no commit is supplied it deploys `HEAD`. The script exports the requested commit, stages it under `.deploy_tmp/`, then rsyncs into `releases/current/` and a timestamped backup. Point nginx at the `current` directory, e.g.:
 
-```bash
-./deploy.sh <commit-ish>
+```
+server {
+    server_name nn-vis.noelith.dev;
+    root /srv/server/nn-vis/releases/current;
+    index index.html;
+    location / {
+        try_files $uri $uri/ /index.html;
+    }
+}
 ```
 
-The script exports the requested commit into the staging area, syncs it into `releases/current/`, and saves the same tree under `releases/backups/<timestamp>/` with the commit hash recorded in `.commit`.
+Issue TLS certs via `certbot --nginx -d nn-vis.noelith.dev` once the site block is enabled.

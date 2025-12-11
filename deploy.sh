@@ -17,7 +17,7 @@ if ! commit="$(git -C "$REPO_ROOT" rev-parse --verify "$commit_ref" 2>/dev/null)
   exit 1
 fi
 
-DEPLOY_ROOT="/home/Neural-Network-Visualisation/releases"
+DEPLOY_ROOT="$REPO_ROOT/releases"
 CURRENT_DIR="$DEPLOY_ROOT/current"
 BACKUP_DIR="$DEPLOY_ROOT/backups"
 TMP_DIR="$DEPLOY_ROOT/.deploy_tmp"
