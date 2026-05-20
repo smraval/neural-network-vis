@@ -1909,6 +1909,26 @@ class NeuralVisualizer {
     this.renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
     this.renderer.setPixelRatio(window.devicePixelRatio);
     this.renderer.setSize(window.innerWidth, window.innerHeight);
+    // Enable WebXR so the same renderer can be used for immersive VR sessions.
+    if (this.renderer.xr) {
+      this.renderer.xr.enabled = true;
+      if (typeof VRButton !== "undefined" && VRButton && typeof VRButton.createButton === "function") {
+        try {
+          const vrButton = VRButton.createButton(this.renderer);
+          vrButton.id = "enterVrButton";
+          document.body.appendChild(vrButton);
+        } catch (_error) {
+          // If WebXR is not available, fall back silently to non‑VR rendering.
+        }
+      } else {
+        // Helpful hint when running in environments without WebXR / VRButton loaded.
+        // (The experience still works on desktop; VR will simply be unavailable.)
+        // eslint-disable-next-line no-console
+        console.warn(
+          "[WebXR] VRButton not available. Ensure you're on https or http://localhost and that VRButton.js loaded.",
+        );
+      }
+    }
     document.body.appendChild(this.renderer.domElement);
     this.fpsMonitor = this.options.showFpsOverlay ? new FpsMonitor() : null;
 
@@ -2875,40 +2895,32 @@ class NeuralVisualizer {
   }
 
   animate() {
-    this.renderRequested = false;
-    this.needsContinuousRender = false;
-
+    // In VR we want a continuous animation loop driven by the XR session,
+    // while on desktop a regular render loop is also acceptable.
     const renderFrame = (time) => {
-      this.renderRequested = false;
-      const controlsChanged = this.controls.update();
+      const controlsChanged = this.controls ? this.controls.update() : false;
       this.renderer.render(this.scene, this.camera);
       if (this.fpsMonitor) {
         this.fpsMonitor.update(time);
       }
-      if (this.needsContinuousRender || controlsChanged) {
-        this.requestRender();
+      // For desktop, keep a continuous loop to ensure smooth animations
+      // even when the camera is idle.
+      if (!this.renderer.xr || !this.renderer.xr.isPresenting) {
+        if (controlsChanged) {
+          // nothing extra required, next frame will reflect updated controls
+        }
       }
     };
 
-    this.requestRender = () => {
-      if (this.renderRequested) return;
-      this.renderRequested = true;
-      requestAnimationFrame(renderFrame);
-    };
-
-    this.controls.addEventListener("start", () => {
-      this.needsContinuousRender = true;
-      this.requestRender();
-    });
-    this.controls.addEventListener("end", () => {
-      this.needsContinuousRender = false;
-      this.requestRender();
-    });
-    this.controls.addEventListener("change", () => {
-      this.requestRender();
-    });
-
-    this.requestRender();
+    if (this.renderer && typeof this.renderer.setAnimationLoop === "function") {
+      this.renderer.setAnimationLoop(renderFrame);
+    } else {
+      const loop = (time) => {
+        renderFrame(time);
+        requestAnimationFrame(loop);
+      };
+      requestAnimationFrame(loop);
+    }
   }
 }
 

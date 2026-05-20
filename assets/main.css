@@ -25,6 +25,15 @@ body > canvas {
   z-index: 1 !important;
 }
 
+/* Ensure Three.js VRButton is always visible above overlays. */
+#enterVrButton,
+button#VRButton {
+  position: fixed !important;
+  left: 18px !important;
+  bottom: 18px !important;
+  z-index: 30 !important;
+}
+
 .overlay-2d {
   position: absolute;
   top: 16px;
