@@ -1897,14 +1897,15 @@ class NeuralVisualizer {
     this.pointerVector = new THREE.Vector2();
     this.pointerDown = null;
     this.desktopBackgroundSky = null;
+    this.xrContentRoot = null;
     this.xrPlayer = null;
     this.xrControllers = [];
     this.vrLocomotionActive = false;
+    this.vrClock = null;
     this.vrMoveForward = new THREE.Vector3();
     this.vrMoveRight = new THREE.Vector3();
     this.vrControllerWorldPos = new THREE.Vector3();
     this.vrGrabDelta = new THREE.Vector3();
-    this.vrLastFrameTime = 0;
     this.initThreeScene();
     this.buildLayers();
     this.buildConnections();
@@ -1949,8 +1950,13 @@ class NeuralVisualizer {
     document.body.appendChild(this.renderer.domElement);
     this.fpsMonitor = this.options.showFpsOverlay ? new FpsMonitor() : null;
 
+    // Network + labels live here so VR locomotion can translate the world (Three r128 WebXR
+    // overwrites the camera pose each frame, so moving xrPlayer alone does not walk).
+    this.xrContentRoot = new THREE.Group();
+    this.scene.add(this.xrContentRoot);
+
     this.labelGroup = new THREE.Group();
-    this.scene.add(this.labelGroup);
+    this.xrContentRoot.add(this.labelGroup);
 
     this.camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 200);
     this.camera.position.set(-15, 0, 15);
@@ -1966,20 +1972,20 @@ class NeuralVisualizer {
     this.controls.target.set(0, 0, 0);
 
     const ambient = new THREE.AmbientLight(0xffffff, 1.2);
-    this.scene.add(ambient);
+    this.xrContentRoot.add(ambient);
     const hemisphere = new THREE.HemisphereLight(0xffffff, 0x1a1d2e, 0.9);
     hemisphere.position.set(0, 20, 0);
-    this.scene.add(hemisphere);
+    this.xrContentRoot.add(hemisphere);
     const directional = new THREE.DirectionalLight(0xffffff, 1.4);
     directional.position.set(18, 26, 24);
     directional.castShadow = true;
-    this.scene.add(directional);
+    this.xrContentRoot.add(directional);
     const fillLight = new THREE.DirectionalLight(0xa8c5ff, 0.8);
     fillLight.position.set(-20, 18, -18);
-    this.scene.add(fillLight);
+    this.xrContentRoot.add(fillLight);
     const rimLight = new THREE.PointLight(0x88a4ff, 0.6, 60, 1.6);
     rimLight.position.set(0, 12, -24);
-    this.scene.add(rimLight);
+    this.xrContentRoot.add(rimLight);
 
     this.renderer.domElement.addEventListener("pointerdown", (event) => this.handleScenePointerDown(event));
     this.renderer.domElement.addEventListener("pointerup", (event) => this.handleScenePointerUp(event));
@@ -2057,8 +2063,7 @@ class NeuralVisualizer {
       // Desktop uses CSS on body; VR uses the same gradient on an inverted sky sphere.
       this.showDesktopBackgroundSky();
       if (this.controls) {
-        // Keep mouse drag / scroll (OrbitControls) on desktop; headsets use controllers only.
-        this.controls.enabled = this.desktopNav();
+        this.controls.enabled = false;
         this.controls.enableZoom = true;
       }
     } else {
@@ -2075,6 +2080,14 @@ class NeuralVisualizer {
     if (!this.renderer?.xr || this.vrLocomotionActive) return;
     this.vrLocomotionActive = true;
     this.xrPlayer.position.set(0, 0, 0);
+    if (this.xrContentRoot) {
+      this.xrContentRoot.position.set(0, 0, 0);
+    }
+    if (!this.vrClock) {
+      this.vrClock = new THREE.Clock();
+    }
+    this.vrClock.start();
+    this.vrClock.getDelta();
     this.xrControllers = [0, 1].map((index) => this.createXrController(index));
   }
 
@@ -2096,8 +2109,13 @@ class NeuralVisualizer {
     });
     this.xrControllers = [];
     this.xrPlayer.position.set(0, 0, 0);
+    if (this.xrContentRoot) {
+      this.xrContentRoot.position.set(0, 0, 0);
+    }
+    if (this.vrClock) {
+      this.vrClock.stop();
+    }
     this.vrLocomotionActive = false;
-    this.vrLastFrameTime = 0;
   }
 
   createXrController(index) {
@@ -2135,7 +2153,7 @@ class NeuralVisualizer {
       tipMaterial.color.setHex(color);
       if (isGrabbing) {
         controller.userData.grabAnchor.setFromMatrixPosition(controller.matrixWorld);
-        controller.userData.grabPlayerOrigin.copy(this.xrPlayer.position);
+        controller.userData.grabPlayerOrigin.copy(this.xrContentRoot.position);
       }
     };
 
@@ -2147,13 +2165,15 @@ class NeuralVisualizer {
   }
 
   readThumbstick(gamepad) {
+    if (!gamepad) return { x: 0, y: 0 };
+    const axes = gamepad.axes || [];
+    const deadzone = 0.2;
+    // Quest / xr-standard: thumbstick is usually axes 0–1; 2–3 can be triggers on some profiles.
     const pairs = [
       [0, 1],
       [2, 3],
     ];
-    const deadzone = 0.15;
     for (let i = 0; i < pairs.length; i += 1) {
-      const axes = gamepad.axes || [];
       const x = axes[pairs[i][0]] || 0;
       const y = axes[pairs[i][1]] || 0;
       if (Math.hypot(x, y) > deadzone) {
@@ -2163,23 +2183,30 @@ class NeuralVisualizer {
     return { x: 0, y: 0 };
   }
 
+  readSessionThumbstick(session) {
+    let thumbstick = null;
+    session.inputSources.forEach((source) => {
+      const gamepad = source.gamepad;
+      if (!gamepad || !gamepad.connected) return;
+      const stick = this.readThumbstick(gamepad);
+      if (Math.hypot(stick.x, stick.y) < 0.01) return;
+      if (!thumbstick || source.handedness === "left") {
+        thumbstick = stick;
+      }
+    });
+    return thumbstick;
+  }
+
   updateVrLocomotion(deltaSeconds) {
-    if (!this.vrLocomotionActive || !this.renderer?.xr?.isPresenting || deltaSeconds <= 0) return;
-    // Desktop uses OrbitControls (mouse); skip thumbstick / grab on xrPlayer.
-    if (this.desktopNav()) return;
+    if (!this.vrLocomotionActive || !this.renderer?.xr?.isPresenting || !this.xrContentRoot) return;
+    if (deltaSeconds <= 0) {
+      deltaSeconds = 1 / 90;
+    }
 
     const session = this.renderer.xr.getSession();
     if (session) {
       const speed = 2.8;
-      let thumbstick = null;
-      session.inputSources.forEach((source) => {
-        if (!source.gamepad) return;
-        const stick = this.readThumbstick(source.gamepad);
-        if (Math.hypot(stick.x, stick.y) < 0.01) return;
-        if (!thumbstick || source.handedness === "left") {
-          thumbstick = stick;
-        }
-      });
+      const thumbstick = this.readSessionThumbstick(session);
       if (thumbstick) {
         this.camera.getWorldDirection(this.vrMoveForward);
         this.vrMoveForward.y = 0;
@@ -2190,8 +2217,9 @@ class NeuralVisualizer {
         }
         this.vrMoveRight.crossVectors(this.vrMoveForward, new THREE.Vector3(0, 1, 0)).normalize();
 
-        this.xrPlayer.position.addScaledVector(this.vrMoveForward, thumbstick.y * speed * deltaSeconds);
-        this.xrPlayer.position.addScaledVector(this.vrMoveRight, thumbstick.x * speed * deltaSeconds);
+        // Translate the network toward the user (inverse of desired walk direction).
+        this.xrContentRoot.position.addScaledVector(this.vrMoveForward, -thumbstick.y * speed * deltaSeconds);
+        this.xrContentRoot.position.addScaledVector(this.vrMoveRight, -thumbstick.x * speed * deltaSeconds);
       }
     }
 
@@ -2199,7 +2227,7 @@ class NeuralVisualizer {
       if (!controller.userData.grabbing) return;
       this.vrControllerWorldPos.setFromMatrixPosition(controller.matrixWorld);
       this.vrGrabDelta.copy(controller.userData.grabAnchor).sub(this.vrControllerWorldPos);
-      this.xrPlayer.position.copy(controller.userData.grabPlayerOrigin).add(this.vrGrabDelta);
+      this.xrContentRoot.position.copy(controller.userData.grabPlayerOrigin).add(this.vrGrabDelta);
     });
   }
 
@@ -2351,7 +2379,7 @@ class NeuralVisualizer {
     if (data.incoming.length) {
       const mesh = createMesh(data.incoming);
       if (mesh) {
-        this.scene.add(mesh);
+        this.xrContentRoot.add(mesh);
         this.selectionConnectionGroups.push({
           mesh,
           connections: data.incoming,
@@ -2362,7 +2390,7 @@ class NeuralVisualizer {
     if (data.outgoing.length) {
       const mesh = createMesh(data.outgoing);
       if (mesh) {
-        this.scene.add(mesh);
+        this.xrContentRoot.add(mesh);
         this.selectionConnectionGroups.push({
           mesh,
           connections: data.outgoing,
@@ -2380,7 +2408,7 @@ class NeuralVisualizer {
     }
     this.selectionConnectionGroups.forEach((group) => {
       if (!group?.mesh) return;
-      this.scene.remove(group.mesh);
+      group.mesh.parent?.remove(group.mesh);
       const material = group.mesh.material;
       if (Array.isArray(material)) {
         material.forEach((mat) => {
@@ -2501,7 +2529,7 @@ class NeuralVisualizer {
     const sprite = new THREE.Sprite(material);
     sprite.visible = false;
     sprite.renderOrder = 10;
-    this.scene.add(sprite);
+    this.xrContentRoot.add(sprite);
     this.selectionGlowSprite = sprite;
     return sprite;
   }
@@ -2728,7 +2756,7 @@ class NeuralVisualizer {
 
         mesh.instanceMatrix.needsUpdate = true;
         mesh.instanceColor.needsUpdate = true;
-        this.scene.add(mesh);
+        this.xrContentRoot.add(mesh);
         this.layerMeshes.push({ mesh, positions, type: "input", layerIndex });
       } else {
         const material = hiddenBaseMaterial.clone();
@@ -2749,7 +2777,7 @@ class NeuralVisualizer {
 
         mesh.instanceMatrix.needsUpdate = true;
         mesh.instanceColor.needsUpdate = true;
-        this.scene.add(mesh);
+        this.xrContentRoot.add(mesh);
         const layerType = isOutputLayer ? "output" : "hidden";
         this.layerMeshes.push({ mesh, positions, type: layerType, layerIndex });
         if (isOutputLayer) {
@@ -2916,7 +2944,7 @@ class NeuralVisualizer {
 
       mesh.instanceMatrix.needsUpdate = true;
       mesh.instanceColor.needsUpdate = true;
-      this.scene.add(mesh);
+      this.xrContentRoot.add(mesh);
       this.connectionGroups.push({
         mesh,
         connections: selected,
@@ -2928,7 +2956,7 @@ class NeuralVisualizer {
 
   disposeConnectionMeshes() {
     this.connectionGroups.forEach((group) => {
-      this.scene.remove(group.mesh);
+      group.mesh.parent?.remove(group.mesh);
       if (group.mesh.geometry && typeof group.mesh.geometry.dispose === "function") {
         group.mesh.geometry.dispose();
       }
@@ -3129,13 +3157,10 @@ class NeuralVisualizer {
     // In VR we want a continuous animation loop driven by the XR session,
     // while on desktop a regular render loop is also acceptable.
     const renderFrame = (time) => {
-      const deltaSeconds = this.vrLastFrameTime ? Math.min((time - this.vrLastFrameTime) / 1000, 0.05) : 0;
-      this.vrLastFrameTime = time;
       const inVr = Boolean(this.renderer.xr?.isPresenting);
-      if (inVr) {
+      if (inVr && this.vrClock) {
+        const deltaSeconds = Math.min(this.vrClock.getDelta(), 0.05);
         this.updateVrLocomotion(deltaSeconds);
-      } else {
-        this.vrLastFrameTime = 0;
       }
 
       const controlsChanged = this.controls ? this.controls.update() : false;
