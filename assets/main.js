@@ -1896,6 +1896,15 @@ class NeuralVisualizer {
     this.raycaster = new THREE.Raycaster();
     this.pointerVector = new THREE.Vector2();
     this.pointerDown = null;
+    this.desktopBackgroundSky = null;
+    this.xrPlayer = null;
+    this.xrControllers = [];
+    this.vrLocomotionActive = false;
+    this.vrMoveForward = new THREE.Vector3();
+    this.vrMoveRight = new THREE.Vector3();
+    this.vrControllerWorldPos = new THREE.Vector3();
+    this.vrGrabDelta = new THREE.Vector3();
+    this.vrLastFrameTime = 0;
     this.initThreeScene();
     this.buildLayers();
     this.buildConnections();
@@ -1912,6 +1921,14 @@ class NeuralVisualizer {
     // Enable WebXR so the same renderer can be used for immersive VR sessions.
     if (this.renderer.xr) {
       this.renderer.xr.enabled = true;
+      this.renderer.xr.addEventListener("sessionstart", () => {
+        this.setXrPresentationMode(true);
+        this.setupVrLocomotion();
+      });
+      this.renderer.xr.addEventListener("sessionend", () => {
+        this.teardownVrLocomotion();
+        this.setXrPresentationMode(false);
+      });
       if (typeof VRButton !== "undefined" && VRButton && typeof VRButton.createButton === "function") {
         try {
           const vrButton = VRButton.createButton(this.renderer);
@@ -1937,6 +1954,9 @@ class NeuralVisualizer {
 
     this.camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 200);
     this.camera.position.set(-15, 0, 15);
+    this.xrPlayer = new THREE.Group();
+    this.xrPlayer.add(this.camera);
+    this.scene.add(this.xrPlayer);
 
     this.controls = new THREE.OrbitControls(this.camera, this.renderer.domElement);
     this.controls.enableDamping = true;
@@ -1969,6 +1989,217 @@ class NeuralVisualizer {
       if (event.key === "Escape") {
         this.clearSelection();
       }
+    });
+  }
+
+  createDesktopBackgroundTexture() {
+    // Mirrors main.css: body { background: radial-gradient(circle at 20% 20%, #2d3f72, #101a33 65%); }
+    const width = 2048;
+    const height = 2048;
+    const canvas = document.createElement("canvas");
+    canvas.width = width;
+    canvas.height = height;
+    const ctx = canvas.getContext("2d");
+    const centerX = width * 0.2;
+    const centerY = height * 0.2;
+    const outerRadius = Math.max(width, height) * 0.65;
+    const gradient = ctx.createRadialGradient(centerX, centerY, 0, centerX, centerY, outerRadius);
+    gradient.addColorStop(0, "#2d3f72");
+    gradient.addColorStop(1, "#101a33");
+    ctx.fillStyle = gradient;
+    ctx.fillRect(0, 0, width, height);
+    const texture = new THREE.CanvasTexture(canvas);
+    texture.needsUpdate = true;
+    return texture;
+  }
+
+  ensureDesktopBackgroundSky() {
+    if (this.desktopBackgroundSky) return this.desktopBackgroundSky;
+    const texture = this.createDesktopBackgroundTexture();
+    const geometry = new THREE.SphereGeometry(120, 48, 32);
+    const material = new THREE.MeshBasicMaterial({
+      map: texture,
+      side: THREE.BackSide,
+      depthWrite: false,
+      fog: false,
+    });
+    const sky = new THREE.Mesh(geometry, material);
+    sky.name = "desktopBackgroundSky";
+    sky.frustumCulled = false;
+    sky.renderOrder = -1000;
+    this.desktopBackgroundSky = sky;
+    return sky;
+  }
+
+  showDesktopBackgroundSky() {
+    const sky = this.ensureDesktopBackgroundSky();
+    if (!sky.parent) {
+      this.camera.add(sky);
+      sky.position.set(0, 0, 0);
+    }
+    this.scene.background = null;
+    this.renderer.setClearColor(0x101a33, 1);
+  }
+
+  hideDesktopBackgroundSky() {
+    if (this.desktopBackgroundSky?.parent) {
+      this.desktopBackgroundSky.parent.remove(this.desktopBackgroundSky);
+    }
+  }
+
+  desktopNav() {
+    return window.matchMedia("(pointer: fine)").matches;
+  }
+
+  setXrPresentationMode(isVr) {
+    if (!this.renderer || !this.scene) return;
+    if (isVr) {
+      // Desktop uses CSS on body; VR uses the same gradient on an inverted sky sphere.
+      this.showDesktopBackgroundSky();
+      if (this.controls) {
+        // Keep mouse drag / scroll (OrbitControls) on desktop; headsets use controllers only.
+        this.controls.enabled = this.desktopNav();
+        this.controls.enableZoom = true;
+      }
+    } else {
+      this.hideDesktopBackgroundSky();
+      this.scene.background = null;
+      this.renderer.setClearColor(0x000000, 0);
+      if (this.controls) {
+        this.controls.enabled = true;
+      }
+    }
+  }
+
+  setupVrLocomotion() {
+    if (!this.renderer?.xr || this.vrLocomotionActive) return;
+    this.vrLocomotionActive = true;
+    this.xrPlayer.position.set(0, 0, 0);
+    this.xrControllers = [0, 1].map((index) => this.createXrController(index));
+  }
+
+  teardownVrLocomotion() {
+    if (!this.vrLocomotionActive) return;
+    this.xrControllers.forEach((controller) => {
+      this.scene.remove(controller);
+      controller.traverse((child) => {
+        if (child.geometry && typeof child.geometry.dispose === "function") {
+          child.geometry.dispose();
+        }
+        if (child.material) {
+          const materials = Array.isArray(child.material) ? child.material : [child.material];
+          materials.forEach((material) => {
+            if (material && typeof material.dispose === "function") material.dispose();
+          });
+        }
+      });
+    });
+    this.xrControllers = [];
+    this.xrPlayer.position.set(0, 0, 0);
+    this.vrLocomotionActive = false;
+    this.vrLastFrameTime = 0;
+  }
+
+  createXrController(index) {
+    const controller = this.renderer.xr.getController(index);
+    controller.userData.grabbing = false;
+    controller.userData.grabAnchor = new THREE.Vector3();
+    controller.userData.grabPlayerOrigin = new THREE.Vector3();
+
+    const lineGeometry = new THREE.BufferGeometry().setFromPoints([
+      new THREE.Vector3(0, 0, 0),
+      new THREE.Vector3(0, 0, -1),
+    ]);
+    const lineMaterial = new THREE.LineBasicMaterial({
+      color: 0x4da6ff,
+      linewidth: 1,
+      transparent: true,
+      opacity: 0.85,
+    });
+    const line = new THREE.Line(lineGeometry, lineMaterial);
+    line.name = "ray";
+    line.scale.z = 3;
+    controller.add(line);
+
+    const tipGeometry = new THREE.SphereGeometry(0.035, 12, 12);
+    const tipMaterial = new THREE.MeshBasicMaterial({ color: 0x4da6ff });
+    const tip = new THREE.Mesh(tipGeometry, tipMaterial);
+    tip.name = "tip";
+    tip.position.z = -3;
+    controller.add(tip);
+
+    const setGrabbing = (isGrabbing) => {
+      controller.userData.grabbing = isGrabbing;
+      const color = isGrabbing ? 0xffaa44 : 0x4da6ff;
+      lineMaterial.color.setHex(color);
+      tipMaterial.color.setHex(color);
+      if (isGrabbing) {
+        controller.userData.grabAnchor.setFromMatrixPosition(controller.matrixWorld);
+        controller.userData.grabPlayerOrigin.copy(this.xrPlayer.position);
+      }
+    };
+
+    controller.addEventListener("squeezestart", () => setGrabbing(true));
+    controller.addEventListener("squeezeend", () => setGrabbing(false));
+
+    this.scene.add(controller);
+    return controller;
+  }
+
+  readThumbstick(gamepad) {
+    const pairs = [
+      [0, 1],
+      [2, 3],
+    ];
+    const deadzone = 0.15;
+    for (let i = 0; i < pairs.length; i += 1) {
+      const axes = gamepad.axes || [];
+      const x = axes[pairs[i][0]] || 0;
+      const y = axes[pairs[i][1]] || 0;
+      if (Math.hypot(x, y) > deadzone) {
+        return { x, y: -y };
+      }
+    }
+    return { x: 0, y: 0 };
+  }
+
+  updateVrLocomotion(deltaSeconds) {
+    if (!this.vrLocomotionActive || !this.renderer?.xr?.isPresenting || deltaSeconds <= 0) return;
+    // Desktop uses OrbitControls (mouse); skip thumbstick / grab on xrPlayer.
+    if (this.desktopNav()) return;
+
+    const session = this.renderer.xr.getSession();
+    if (session) {
+      const speed = 2.8;
+      let thumbstick = null;
+      session.inputSources.forEach((source) => {
+        if (!source.gamepad) return;
+        const stick = this.readThumbstick(source.gamepad);
+        if (Math.hypot(stick.x, stick.y) < 0.01) return;
+        if (!thumbstick || source.handedness === "left") {
+          thumbstick = stick;
+        }
+      });
+      if (thumbstick) {
+        this.camera.getWorldDirection(this.vrMoveForward);
+        this.vrMoveForward.y = 0;
+        if (this.vrMoveForward.lengthSq() < 1e-6) {
+          this.vrMoveForward.set(0, 0, -1);
+        } else {
+          this.vrMoveForward.normalize();
+        }
+        this.vrMoveRight.crossVectors(this.vrMoveForward, new THREE.Vector3(0, 1, 0)).normalize();
+
+        this.xrPlayer.position.addScaledVector(this.vrMoveForward, thumbstick.y * speed * deltaSeconds);
+        this.xrPlayer.position.addScaledVector(this.vrMoveRight, thumbstick.x * speed * deltaSeconds);
+      }
+    }
+
+    this.xrControllers.forEach((controller) => {
+      if (!controller.userData.grabbing) return;
+      this.vrControllerWorldPos.setFromMatrixPosition(controller.matrixWorld);
+      this.vrGrabDelta.copy(controller.userData.grabAnchor).sub(this.vrControllerWorldPos);
+      this.xrPlayer.position.copy(controller.userData.grabPlayerOrigin).add(this.vrGrabDelta);
     });
   }
 
@@ -2898,6 +3129,15 @@ class NeuralVisualizer {
     // In VR we want a continuous animation loop driven by the XR session,
     // while on desktop a regular render loop is also acceptable.
     const renderFrame = (time) => {
+      const deltaSeconds = this.vrLastFrameTime ? Math.min((time - this.vrLastFrameTime) / 1000, 0.05) : 0;
+      this.vrLastFrameTime = time;
+      const inVr = Boolean(this.renderer.xr?.isPresenting);
+      if (inVr) {
+        this.updateVrLocomotion(deltaSeconds);
+      } else {
+        this.vrLastFrameTime = 0;
+      }
+
       const controlsChanged = this.controls ? this.controls.update() : false;
       this.renderer.render(this.scene, this.camera);
       if (this.fpsMonitor) {
